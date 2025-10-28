@@ -1,0 +1,36 @@
+# Optional: NGINX Ingress Controller (NIC) VirtualServer example
+# Purpose: Demonstrate a native traffic split (80/20) at the NIC layer,
+# sending 80% to hello-v1 and 20% to gateway-bridge (which forwards into Gateway).
+#
+# Requirements:
+# - NGINX Ingress Controller (OSS) installed via Helm (chart: nginx-stable/nginx-ingress)
+# - enableCustomResources=true in NIC Helm install so VirtualServer CRD is present
+# - The resources in examples/ingress-to-gateway-canary/manifest.yaml applied
+#   (Namespace, hello-v1/hello-v2, gateway-bridge, etc.)
+#
+# Usage:
+# - Apply: kubectl apply -f examples/ingress-to-gateway-canary/virtualserver.yaml
+# - Ensure your external access is set up for NIC (e.g., LoadBalancer or NodePort)
+# - Test via the same host canary.127.0.0.1.nip.io (adjust host if needed)
+
+apiVersion: k8s.nginx.org/v1
+kind: VirtualServer
+metadata:
+  name: canary-virtualserver
+  namespace: ingress-to-gateway-canary
+spec:
+  host: canary.127.0.0.1.nip.io
+  upstreams:
+    - name: hello-v1
+      service: hello-v1
+      port: 80
+    - name: gateway-bridge
+      service: gateway-bridge
+      port: 80
+  routes:
+    - path: /
+      splits:
+        - weight: 80
+          upstream: hello-v1
+        - weight: 20
+          upstream: gateway-bridge
