@@ -1,0 +1,315 @@
+# Minimal example: Canary 20% from Ingress (NGINX) to Gateway API
+# This example demonstrates how to keep an existing NGINX Ingress-based entrypoint
+# and canary 20% of traffic to a Gateway API deployment.
+#
+# Pattern:
+# - Primary Ingress -> hello-v1 (80%)
+# - Ingress Canary (via NGINX annotations) -> gateway-bridge Service (20%)
+# - gateway-bridge is a tiny nginx reverse-proxy that preserves Host and forwards to the
+#   Gateway controller's data-plane Service inside the cluster.
+# - A Gateway + HTTPRoute handle host routing to hello-v2.
+#
+# Assumptions:
+# - NGINX Ingress Controller is installed and uses ingressClassName: nginx
+# - A Gateway controller is installed. This example assumes NGINX Gateway Fabric (NGF)
+#   with a GatewayClass named "nginx" and the data-plane Service DNS:
+#     nginx-gateway.nginx-gateway.svc.cluster.local:80
+#   If your controller differs, change the bridge ConfigMap upstream accordingly.
+#
+# Notes:
+# - Percentage-based canary at the Ingress layer relies on NGINX Ingress annotations:
+#     nginx.ingress.kubernetes.io/canary: "true"
+#     nginx.ingress.kubernetes.io/canary-weight: "20"
+# - Ingress backends must be Services; they cannot directly reference a Gateway listener.
+#   The bridge service provides a minimal in-cluster hop that forwards into the Gateway.
+# - All resources are kept in one namespace for simplicity.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-to-gateway-canary
+---
+# hello-v1 (primary, 80%)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-v1
+  namespace: ingress-to-gateway-canary
+  labels:
+    app: hello
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hello
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: hello
+        version: v1
+    spec:
+      containers:
+        - name: hello
+          image: nginxdemos/hello:latest
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-v1
+  namespace: ingress-to-gateway-canary
+  labels:
+    app: hello
+    version: v1
+spec:
+  selector:
+    app: hello
+    version: v1
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+---
+# hello-v2 (served by Gateway HTTPRoute)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-v2
+  namespace: ingress-to-gateway-canary
+  labels:
+    app: hello
+    version: v2
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hello
+      version: v2
+  template:
+    metadata:
+      labels:
+        app: hello
+        version: v2
+    spec:
+      containers:
+        - name: hello
+          image: nginxdemos/hello:latest
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-v2
+  namespace: ingress-to-gateway-canary
+  labels:
+    app: hello
+    version: v2
+spec:
+  selector:
+    app: hello
+    version: v2
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+---
+# Gateway (HTTP on 80) for the canary host
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: canary-gateway
+  namespace: ingress-to-gateway-canary
+spec:
+  gatewayClassName: nginx
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: canary.127.0.0.1.nip.io
+---
+# HTTPRoute sends Gateway traffic for the host to hello-v2
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: canary-route
+  namespace: ingress-to-gateway-canary
+spec:
+  parentRefs:
+    - name: canary-gateway
+  hostnames:
+    - canary.127.0.0.1.nip.io
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-From-Gateway
+                value: "true"
+      backendRefs:
+        - name: hello-v2
+          port: 80
+          weight: 1
+---
+# Bridge: minimal nginx reverse-proxy to the Gateway data-plane Service
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-bridge-nginx-conf
+  namespace: ingress-to-gateway-canary
+data:
+  nginx.conf: |
+    user  nginx;
+    worker_processes  auto;
+    error_log  /var/log/nginx/error.log warn;
+    pid        /var/run/nginx.pid;
+
+    events { worker_connections 1024; }
+
+    http {
+      log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+      access_log /var/log/nginx/access.log main;
+
+      # Change this upstream if your Gateway controller uses a different Service/DNS
+      upstream gateway_dp {
+        server nginx-gateway.nginx-gateway.svc.cluster.local:80;
+      }
+
+      server {
+        listen 8080;
+
+        location / {
+          proxy_pass http://gateway_dp;
+          # Preserve Host and forwarding headers so Gateway HTTPRoute can match on host
+          proxy_set_header Host               $host;
+          proxy_set_header X-Forwarded-Host   $host;
+          proxy_set_header X-Forwarded-Proto  $scheme;
+          proxy_set_header X-Forwarded-For    $remote_addr;
+          proxy_http_version 1.1;
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-bridge
+  namespace: ingress-to-gateway-canary
+  labels:
+    app: gateway-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway-bridge
+  template:
+    metadata:
+      labels:
+        app: gateway-bridge
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: gateway-bridge-nginx-conf
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-bridge
+  namespace: ingress-to-gateway-canary
+  labels:
+    app: gateway-bridge
+spec:
+  selector:
+    app: gateway-bridge
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+---
+# Primary Ingress: routes to hello-v1 (default 80%)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hello-primary
+  namespace: ingress-to-gateway-canary
+  annotations:
+    # Optional: preserve host header behavior in some envs
+    nginx.ingress.kubernetes.io/use-regex: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: canary.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hello-v1
+                port:
+                  number: 80
+---
+# Canary Ingress: sends 20% to the gateway-bridge Service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hello-canary
+  namespace: ingress-to-gateway-canary
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "20"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: canary.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway-bridge
+                port:
+                  number: 80
